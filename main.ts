@@ -9,7 +9,10 @@ import { setFlagsFromString } from 'node:v8';
 
 // V8's incremental marking off, set before solve.js is imported so all of its work runs under it (the rules: the house
 // baseline runs with --no-incremental-marking, and an entry may tune V8's flags too).
-setFlagsFromString('--no-incremental-marking');
+// --no-opt (no TurboFan): the heat runs each entry once per round in a fresh process, so the run is cold —
+// TurboFan's compile cost on first execution exceeds what it saves within a single pass (measured cold
+// ~377ms -> ~308ms; warm cost is only ~+25ms, and warm is not the scored regime).
+setFlagsFromString('--no-incremental-marking --no-opt');
 
 /** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };

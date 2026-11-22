@@ -86,12 +86,15 @@ function longDate(S, date) {
 }
 
 /** The body's words: runs of characters other than whitespace (same as /\S+/g). */
+const WS_TABLE = new Uint8Array(128);
+for (const c of [32, 9, 10, 13, 12, 11]) WS_TABLE[c] = 1;
+
 function wordsOf(text) {
   let n = 0;
   let inW = false;
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 13 || c === 12 || c === 11 || (c > 127 && /\s/.test(text[i]));
+    const ws = c < 128 ? WS_TABLE[c] === 1 : /\s/.test(text[i]);
     if (ws) inW = false;
     else if (!inW) { inW = true; n++; }
   }
@@ -243,11 +246,14 @@ function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- markdown
 
-const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+const ESC_TABLE = new Uint8Array(128);
+for (const ch of ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']) ESC_TABLE[ch.charCodeAt(0)] = 1;
+/** Whether a char code is escapable after a backslash (ESCAPABLE as a table: Set.has per char was a hotspot). */
+const escapableCode = (c) => c < 128 && ESC_TABLE[c] === 1;
 
 function findUnescaped(s, what, from) {
   for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
+    if (s[j] === '\\' && j + 1 < s.length && escapableCode(s.charCodeAt(j + 1))) { j++; continue; }
     if (s.startsWith(what, j)) return j;
   }
   return -1;
@@ -256,7 +262,7 @@ function findUnescaped(s, what, from) {
 function findSingleStar(s, from) {
   for (let j = from; j < s.length; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
+    if (c === '\\' && j + 1 < s.length && escapableCode(s.charCodeAt(j + 1))) { j++; continue; }
     if (c !== '*') continue;
     if (s[j + 1] === '*') { j++; continue; }
     return j;
@@ -314,8 +320,11 @@ function resolveLink(S, srcPath, dirParts, target) {
   return href;
 }
 
-/** The next inline special (\\ ` * [) at or after `lastIndex`, via one regex scan. */
-const SPEC_RE = /[\\`*[]/g;
+/** The next inline special (markdown \\ ` * [ or HTML & < > " ') at or after `lastIndex`, via one regex scan.
+ * Fusing the two scans matters: plain runs are emitted raw (the run before a hit holds no special of
+ * either kind), so inline needs no esc() call per run — that was ~184k calls per 3-case pass, 92%
+ * clean, avg 21 chars, where the call + test itself was the cost. Code-span content still uses esc(). */
+const SPEC_RE = /[\\`*[&<>"']/g;
 
 /** `s` rendered inline; links resolved for the source in S. */
 function inline(s, S) {
@@ -323,19 +332,25 @@ function inline(s, S) {
   let i = 0;
   const n = s.length;
   while (i < n) {
-    // Next markdown special (one regex scan; lastIndex is set before every
-    // exec, so the recursion into strong/em/link text cannot corrupt it).
+    // Next special (one regex scan; lastIndex is set before every exec, so
+    // the recursion into strong/em/link text cannot corrupt it).
     SPEC_RE.lastIndex = i;
     const hit = SPEC_RE.exec(s);
     const j = hit === null ? n : hit.index;
     if (j > i) {
-      out += esc(s.slice(i, j));
+      out += s.slice(i, j);
       i = j;
       if (i >= n) break;
     }
     const c = s[i];
+    if (c === '&') { out += '&amp;'; i++; continue; }
+    if (c === '<') { out += '&lt;'; i++; continue; }
+    if (c === '>') { out += '&gt;'; i++; continue; }
+    if (c === '"') { out += '&quot;'; i++; continue; }
+    if (c === "'") { out += '&#39;'; i++; continue; }
     if (c === '\\') {
-      if (i + 1 < n && ESCAPABLE.has(s[i + 1])) { out += esc(s[i + 1]); i += 2; }
+      // '>' is the only escapable char that is also an HTML special.
+      if (i + 1 < n && escapableCode(s.charCodeAt(i + 1))) { out += s[i + 1] === '>' ? '&gt;' : s[i + 1]; i += 2; }
       else { out += '\\'; i++; }
       continue;
     }
@@ -450,29 +465,55 @@ function orderedOf(line) {
   return { start: Number(line.slice(0, j)), text: line.slice(j + 2) };
 }
 
-const CONTINUED = /^ {2,}\S/;
+// A list item's continuation line: /^ {2,}\S/ as char codes (a regex test
+// per list line was a hotspot). Only ' ' counts toward the indent; the
+// next char must be a non-whitespace char.
+function continuedLine(line) {
+  let j = 0;
+  while (j < line.length && line.charCodeAt(j) === 32) j++;
+  if (j < 2 || j >= line.length) return false;
+  const c = line.charCodeAt(j);
+  if (c === 32 || c === 9 || c === 10 || c === 13 || c === 12 || c === 11) return false;
+  return c < 128 || !/\s/.test(line[j]);
+}
 
 /**
  * `src` rendered: its HTML, table of contents and excerpt.
  * S carries the per-case caches and the current source (srcPath, dirParts).
  */
 function renderMarkdown(src, S) {
-  const lines = src.split('\n');
+  // Line starts, not a split array: building the starts costs one indexOf
+  // scan, and each line is sliced on demand (a view, no copy). Measured
+  // faster than src.split('\n') on real bodies; line count and contents
+  // are identical (a trailing '\n' still yields a final empty line).
+  const starts = [0];
+  for (let p = 0; ; ) {
+    const e = src.indexOf('\n', p);
+    if (e === -1) break;
+    starts.push(e + 1);
+    p = e + 1;
+  }
+  const n = starts.length;
+  const L = (i) => src.slice(starts[i], i + 1 < n ? starts[i + 1] - 1 : src.length);
   const ids = new Set();
   const blocks = [];
   const toc = [];
   let excerpt = null;
   let i = 0;
-  const n = lines.length;
   while (i < n) {
-    const line = lines[i];
+    const line = L(i);
     if (isBlankLine(line)) { i++; continue; }
     const c0 = line.charCodeAt(0);
     const lang = c0 === 96 ? fenceOpenOf(line) : null;
     if (lang !== null) {
       const body = [];
       i++;
-      while (i < n && !fenceCloseOf(lines[i])) body.push(lines[i++]);
+      while (i < n) {
+        const l = L(i);
+        if (fenceCloseOf(l)) break;
+        body.push(l);
+        i++;
+      }
       i++;
       const cls = lang === '' ? '' : ` class="language-${esc(lang)}"`;
       blocks.push(`<pre><code${cls}>${body.length === 0 ? '' : esc(body.join('\n')) + '\n'}</code></pre>`);
@@ -490,10 +531,11 @@ function renderMarkdown(src, S) {
     if ((c0 === 45 || c0 === 42) && hrOf(line)) { blocks.push('<hr>'); i++; continue; }
     if (c0 === 62) {
       const body = [];
-      while (i < n && lines[i].charCodeAt(0) === 62) {
-        let l = lines[i++];
-        l = l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1);
-        body.push(l);
+      while (i < n) {
+        const l = L(i);
+        if (l.charCodeAt(0) !== 62) break;
+        i++;
+        body.push(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
       }
       const kept = [];
       for (let k = 0; k < body.length; k++) {
@@ -509,14 +551,14 @@ function renderMarkdown(src, S) {
       const isOrdered = ordered !== null;
       const items = [];
       while (i < n) {
-        const l = lines[i];
+        const l = L(i);
         if (isOrdered) {
           const o = orderedOf(l);
           if (o !== null) { items.push([trimLine(o.text)]); i++; continue; }
         } else if ((l.charCodeAt(0) === 45 || l.charCodeAt(0) === 42) && l.charCodeAt(1) === 32) {
           items.push([trimLine(l.slice(2))]); i++; continue;
         }
-        if (CONTINUED.test(l)) { items[items.length - 1].push(trimLine(l)); i++; continue; }
+        if (continuedLine(l)) { items[items.length - 1].push(trimLine(l)); i++; continue; }
         break;
       }
       const tag = isOrdered ? 'ol' : 'ul';
@@ -529,7 +571,12 @@ function renderMarkdown(src, S) {
     }
     const body = [trimLine(line)];
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < n) {
+      const l = L(i);
+      if (endsParagraph(l)) break;
+      body.push(trimLine(l));
+      i++;
+    }
     const html = inline(body.join('\n'), S);
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
@@ -734,7 +781,9 @@ function cardOf(s, S) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    // Tag link objects are shared per tag (cached on the tag): one card per
+    // post used to allocate a fresh {name, slug, url} per tag. Same JSON.
+    tags: s.tagRefs.map((t) => t.link ?? (t.link = { name: t.name, slug: t.slug, url: t.url })),
   };
 }
 
@@ -880,15 +929,28 @@ export function run(input) {
   const site = { title: input.site.title, base_url: S.base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const pageOf = (s) => ({
-    ...cards.get(s) ?? cardOf(s, S),
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-    newer: s.post ? (s.newer === null ? null : links.get(s.newer)) : null,
-    older: s.post ? (s.older === null ? null : links.get(s.older)) : null,
-    is_post: s.post,
-  });
+  // No spread and no toc copy: the card's fields are listed directly, and
+  // s.toc already holds exactly {level, id, html} entries, which nothing
+  // mutates afterwards — sharing the array gives identical JSON.
+  const pageOf = (s) => {
+    const card = cards.get(s) ?? cardOf(s, S);
+    return {
+      title: card.title,
+      url: card.url,
+      date: card.date,
+      date_long: card.date_long,
+      summary: card.summary,
+      excerpt: card.excerpt,
+      reading_minutes: card.reading_minutes,
+      tags: card.tags,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: s.post ? (s.newer === null ? null : links.get(s.newer)) : null,
+      older: s.post ? (s.older === null ? null : links.get(s.older)) : null,
+      is_post: s.post,
+    };
+  };
   for (const s of kept) {
     const html = render(s.layout, { site, tags: allTags, recent, page: pageOf(s) });
     output[`${s.outDir}/index.html`] = html;
